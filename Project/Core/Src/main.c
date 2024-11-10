@@ -20,11 +20,10 @@
 #include "main.h"
 #include "cmsis_os.h"
 #include "usb_device.h"
-#include "usbd_cdc_if.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "usbd_cdc_if.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -60,7 +59,32 @@ UART_HandleTypeDef huart1;
 
 SDRAM_HandleTypeDef hsdram1;
 
-osThreadId defaultTaskHandle;
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = { .name = "defaultTask",
+		.stack_size = 128 * 4, .priority = (osPriority_t) osPriorityNormal, };
+/* Definitions for motionTask */
+osThreadId_t motionTaskHandle;
+const osThreadAttr_t motionTask_attributes =
+		{ .name = "motionTask", .stack_size = 128 * 4, .priority =
+				(osPriority_t) osPriorityAboveNormal, };
+/* Definitions for captureTask */
+osThreadId_t captureTaskHandle;
+const osThreadAttr_t captureTask_attributes = { .name = "captureTask",
+		.stack_size = 128 * 4, .priority = (osPriority_t) osPriorityNormal, };
+/* Definitions for alertTask */
+osThreadId_t alertTaskHandle;
+const osThreadAttr_t alertTask_attributes = { .name = "alertTask", .stack_size =
+		128 * 4, .priority = (osPriority_t) osPriorityBelowNormal, };
+/* Definitions for alertTimer */
+osTimerId_t alertTimerHandle;
+const osTimerAttr_t alertTimer_attributes = { .name = "alertTimer" };
+/* Definitions for motionEvent */
+osEventFlagsId_t motionEventHandle;
+const osEventFlagsAttr_t motionEvent_attributes = { .name = "motionEvent" };
+/* Definitions for alertEvent */
+osEventFlagsId_t alertEventHandle;
+const osEventFlagsAttr_t alertEvent_attributes = { .name = "alertEvent" };
 /* USER CODE BEGIN PV */
 
 /* USER CODE END PV */
@@ -77,7 +101,11 @@ static void MX_SPI5_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_SPI4_Init(void);
-void StartDefaultTask(void const *argument);
+void StartDefaultTask(void *argument);
+void StartMotionTask(void *argument);
+void StartCaptureTask(void *argument);
+void StartAlertTask(void *argument);
+void alertTimerCallback(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -129,6 +157,9 @@ int main(void) {
 
 	/* USER CODE END 2 */
 
+	/* Init scheduler */
+	osKernelInitialize();
+
 	/* USER CODE BEGIN RTOS_MUTEX */
 	/* add mutexes, ... */
 	/* USER CODE END RTOS_MUTEX */
@@ -136,6 +167,11 @@ int main(void) {
 	/* USER CODE BEGIN RTOS_SEMAPHORES */
 	/* add semaphores, ... */
 	/* USER CODE END RTOS_SEMAPHORES */
+
+	/* Create the timer(s) */
+	/* creation of alertTimer */
+	alertTimerHandle = osTimerNew(alertTimerCallback, osTimerOnce, NULL,
+			&alertTimer_attributes);
 
 	/* USER CODE BEGIN RTOS_TIMERS */
 	/* start timers, add new ones, ... */
@@ -146,13 +182,35 @@ int main(void) {
 	/* USER CODE END RTOS_QUEUES */
 
 	/* Create the thread(s) */
-	/* definition and creation of defaultTask */
-	osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 4096);
-	defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
+	/* creation of defaultTask */
+	defaultTaskHandle = osThreadNew(StartDefaultTask, NULL,
+			&defaultTask_attributes);
+
+	/* creation of motionTask */
+	motionTaskHandle = osThreadNew(StartMotionTask, NULL,
+			&motionTask_attributes);
+
+	/* creation of captureTask */
+	captureTaskHandle = osThreadNew(StartCaptureTask, NULL,
+			&captureTask_attributes);
+
+	/* creation of alertTask */
+	alertTaskHandle = osThreadNew(StartAlertTask, NULL, &alertTask_attributes);
 
 	/* USER CODE BEGIN RTOS_THREADS */
 	/* add threads, ... */
 	/* USER CODE END RTOS_THREADS */
+
+	/* Create the event(s) */
+	/* creation of motionEvent */
+	motionEventHandle = osEventFlagsNew(&motionEvent_attributes);
+
+	/* creation of alertEvent */
+	alertEventHandle = osEventFlagsNew(&alertEvent_attributes);
+
+	/* USER CODE BEGIN RTOS_EVENTS */
+	/* add events, ... */
+	/* USER CODE END RTOS_EVENTS */
 
 	/* Start scheduler */
 	osKernelStart();
@@ -644,8 +702,8 @@ static void MX_GPIO_Init(void) {
 
 	/*Configure GPIO pin : PC8 */
 	GPIO_InitStruct.Pin = GPIO_PIN_8;
-	GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+	GPIO_InitStruct.Pull = GPIO_PULLUP;
 	HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
 	/*Configure GPIO pins : LD3_Pin LD4_Pin */
@@ -655,6 +713,10 @@ static void MX_GPIO_Init(void) {
 	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
 	HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
 
+	/* EXTI interrupt init*/
+	HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5, 0);
+	HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+
 	/* USER CODE BEGIN MX_GPIO_Init_2 */
 	/* USER CODE END MX_GPIO_Init_2 */
 }
@@ -662,6 +724,20 @@ static void MX_GPIO_Init(void) {
 /* USER CODE BEGIN 4 */
 void CDC_Print(const char *msg) {
 	CDC_Transmit_HS((uint8_t*) msg, strlen(msg));
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+	CDC_Print("Interrupt triggered!\r\n");
+
+	if (GPIO_Pin == GPIO_PIN_8) {
+		CDC_Print("Setting motion event flag...\r\n");
+		osEventFlagsSet(motionEventHandle, 0x01);
+
+		CDC_Print("Starting 10 second timeout...\r\n");
+		osTimerStart(alertTimerHandle, 10000);
+	} else {
+		CDC_Print("Unexpected GPIO pin\r\n");
+	}
 }
 /* USER CODE END 4 */
 
@@ -672,13 +748,100 @@ void CDC_Print(const char *msg) {
  * @retval None
  */
 /* USER CODE END Header_StartDefaultTask */
-void StartDefaultTask(void const *argument) {
+void StartDefaultTask(void *argument) {
+	/* init code for USB_DEVICE */
 	MX_USB_DEVICE_Init();
-
+	/* USER CODE BEGIN 5 */
+	CDC_Print("Waiting in default task...\r\n");
+	/* Infinite loop */
 	for (;;) {
-		CDC_Print("Hello World!\r\n");
 		osDelay(1000);
 	}
+	/* USER CODE END 5 */
+}
+
+/* USER CODE BEGIN Header_StartMotionTask */
+/**
+ * @brief  Function implementing the motionTask thread.
+ * @param  argument: Not used
+ * @retval None
+ */
+/* USER CODE END Header_StartMotionTask */
+void StartMotionTask(void *argument) {
+	/* USER CODE BEGIN StartMotionTask */
+	/* Infinite loop */
+	for (;;) {
+		osEventFlagsWait(motionEventHandle, 0x01, osFlagsWaitAny,
+		osWaitForever);
+
+		CDC_Print("Motion task started\r\n");
+
+		CDC_Print("Setting alert event flag...\r\n");
+		osEventFlagsSet(alertEventHandle, 0x01);
+
+		CDC_Print("Clearing motion event flag...\r\n");
+		osEventFlagsClear(motionEventHandle, 0x01);
+
+		osDelay(10);
+	}
+	/* USER CODE END StartMotionTask */
+}
+
+/* USER CODE BEGIN Header_StartCaptureTask */
+/**
+ * @brief Function implementing the captureTask thread.
+ * @param argument: Not used
+ * @retval None
+ */
+/* USER CODE END Header_StartCaptureTask */
+void StartCaptureTask(void *argument) {
+	/* USER CODE BEGIN StartCaptureTask */
+	/* Infinite loop */
+	for (;;) {
+		osEventFlagsWait(alertEventHandle, 0x01, osFlagsWaitAny,
+		osWaitForever);
+
+		CDC_Print("Capture task started\r\n");
+
+		while (osEventFlagsGet(alertEventHandle) & 0x01) {
+			// capture image
+			// display image
+			osDelay(100);
+		}
+	}
+	/* USER CODE END StartCaptureTask */
+}
+
+/* USER CODE BEGIN Header_StartAlertTask */
+/**
+ * @brief Function implementing the alertTask thread.
+ * @param argument: Not used
+ * @retval None
+ */
+/* USER CODE END Header_StartAlertTask */
+void StartAlertTask(void *argument) {
+	/* USER CODE BEGIN StartAlertTask */
+	/* Infinite loop */
+	for (;;) {
+		osEventFlagsWait(alertEventHandle, 0x01, osFlagsWaitAny, osWaitForever);
+
+		CDC_Print("Alert task started\r\n");
+
+		while (osEventFlagsGet(alertEventHandle) & 0x01) {
+			HAL_GPIO_TogglePin(GPIOG, GPIO_PIN_13);
+			CDC_Print("LED toggled\r\n");
+			osDelay(500);
+		}
+	}
+	/* USER CODE END StartAlertTask */
+}
+
+/* alertTimerCallback function */
+void alertTimerCallback(void *argument) {
+	/* USER CODE BEGIN alertTimerCallback */
+	CDC_Print("No motion detected for 10 seconds, clearing alert flag...\r\n");
+	osEventFlagsClear(alertEventHandle, 0x01);
+	/* USER CODE END alertTimerCallback */
 }
 
 /**
