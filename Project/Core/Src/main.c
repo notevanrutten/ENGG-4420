@@ -62,7 +62,7 @@ SDRAM_HandleTypeDef hsdram1;
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = { .name = "defaultTask",
-		.stack_size = 128 * 4, .priority = (osPriority_t) osPriorityNormal, };
+		.stack_size = 128 * 4, .priority = (osPriority_t) osPriorityLow, };
 /* Definitions for motionTask */
 osThreadId_t motionTaskHandle;
 const osThreadAttr_t motionTask_attributes =
@@ -70,21 +70,22 @@ const osThreadAttr_t motionTask_attributes =
 				(osPriority_t) osPriorityAboveNormal, };
 /* Definitions for captureTask */
 osThreadId_t captureTaskHandle;
-const osThreadAttr_t captureTask_attributes = { .name = "captureTask",
-		.stack_size = 128 * 4, .priority = (osPriority_t) osPriorityNormal, };
+const osThreadAttr_t captureTask_attributes =
+		{ .name = "captureTask", .stack_size = 128 * 4, .priority =
+				(osPriority_t) osPriorityBelowNormal, };
 /* Definitions for alertTask */
 osThreadId_t alertTaskHandle;
 const osThreadAttr_t alertTask_attributes = { .name = "alertTask", .stack_size =
-		128 * 4, .priority = (osPriority_t) osPriorityBelowNormal, };
+		128 * 4, .priority = (osPriority_t) osPriorityNormal, };
 /* Definitions for alertTimer */
 osTimerId_t alertTimerHandle;
 const osTimerAttr_t alertTimer_attributes = { .name = "alertTimer" };
-/* Definitions for motionEvent */
-osEventFlagsId_t motionEventHandle;
-const osEventFlagsAttr_t motionEvent_attributes = { .name = "motionEvent" };
-/* Definitions for alertEvent */
-osEventFlagsId_t alertEventHandle;
-const osEventFlagsAttr_t alertEvent_attributes = { .name = "alertEvent" };
+/* Definitions for motionSem */
+osSemaphoreId_t motionSemHandle;
+const osSemaphoreAttr_t motionSem_attributes = { .name = "motionSem" };
+/* Definitions for alertSem */
+osSemaphoreId_t alertSemHandle;
+const osSemaphoreAttr_t alertSem_attributes = { .name = "alertSem" };
 /* USER CODE BEGIN PV */
 
 /* USER CODE END PV */
@@ -164,6 +165,13 @@ int main(void) {
 	/* add mutexes, ... */
 	/* USER CODE END RTOS_MUTEX */
 
+	/* Create the semaphores(s) */
+	/* creation of motionSem */
+	motionSemHandle = osSemaphoreNew(1, 0, &motionSem_attributes);
+
+	/* creation of alertSem */
+	alertSemHandle = osSemaphoreNew(3, 0, &alertSem_attributes);
+
 	/* USER CODE BEGIN RTOS_SEMAPHORES */
 	/* add semaphores, ... */
 	/* USER CODE END RTOS_SEMAPHORES */
@@ -200,13 +208,6 @@ int main(void) {
 	/* USER CODE BEGIN RTOS_THREADS */
 	/* add threads, ... */
 	/* USER CODE END RTOS_THREADS */
-
-	/* Create the event(s) */
-	/* creation of motionEvent */
-	motionEventHandle = osEventFlagsNew(&motionEvent_attributes);
-
-	/* creation of alertEvent */
-	alertEventHandle = osEventFlagsNew(&alertEvent_attributes);
 
 	/* USER CODE BEGIN RTOS_EVENTS */
 	/* add events, ... */
@@ -723,20 +724,16 @@ static void MX_GPIO_Init(void) {
 
 /* USER CODE BEGIN 4 */
 void CDC_Print(const char *msg) {
-	CDC_Transmit_HS((uint8_t*) msg, strlen(msg));
+	while (CDC_Transmit_HS((uint8_t*) msg, strlen(msg)) != USBD_OK) {
+		osDelay(1);
+	}
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
-	CDC_Print("Interrupt triggered!\r\n");
+	CDC_Print("\r\n\r\nInterrupt triggered!\r\n");
 
 	if (GPIO_Pin == GPIO_PIN_8) {
-		CDC_Print("Setting motion event flag...\r\n");
-		osEventFlagsSet(motionEventHandle, 0x01);
-
-		CDC_Print("Starting 10 second timeout...\r\n");
-		osTimerStart(alertTimerHandle, 10000);
-	} else {
-		CDC_Print("Unexpected GPIO pin\r\n");
+		osSemaphoreRelease(motionSemHandle);
 	}
 }
 /* USER CODE END 4 */
@@ -752,7 +749,6 @@ void StartDefaultTask(void *argument) {
 	/* init code for USB_DEVICE */
 	MX_USB_DEVICE_Init();
 	/* USER CODE BEGIN 5 */
-	CDC_Print("Waiting in default task...\r\n");
 	/* Infinite loop */
 	for (;;) {
 		osDelay(1000);
@@ -771,18 +767,21 @@ void StartMotionTask(void *argument) {
 	/* USER CODE BEGIN StartMotionTask */
 	/* Infinite loop */
 	for (;;) {
-		osEventFlagsWait(motionEventHandle, 0x01, osFlagsWaitAny,
-		osWaitForever);
+		osSemaphoreAcquire(motionSemHandle, osWaitForever);
+		CDC_Print("Released motionSem (binary, count=1)\r\n\r\n");
 
-		CDC_Print("Motion task started\r\n");
+		CDC_Print("Acquired motionSem (binary, count=0)\r\n");
+		CDC_Print("Started motionTask\r\n");
 
-		CDC_Print("Setting alert event flag...\r\n");
-		osEventFlagsSet(alertEventHandle, 0x01);
+		CDC_Print("Interrupt timeout reset! (10 seconds)\r\n");
+		osTimerStart(alertTimerHandle, 10000);
 
-		CDC_Print("Clearing motion event flag...\r\n");
-		osEventFlagsClear(motionEventHandle, 0x01);
+		CDC_Print("Released alertSem (counting, count=3)\r\n");
+		CDC_Print("Ended motionTask\r\n\r\n");
 
-		osDelay(10);
+		osSemaphoreRelease(alertSemHandle); // count = 1
+		osSemaphoreRelease(alertSemHandle); // count = 2
+		osSemaphoreRelease(alertSemHandle); // count = 3
 	}
 	/* USER CODE END StartMotionTask */
 }
@@ -798,16 +797,18 @@ void StartCaptureTask(void *argument) {
 	/* USER CODE BEGIN StartCaptureTask */
 	/* Infinite loop */
 	for (;;) {
-		osEventFlagsWait(alertEventHandle, 0x01, osFlagsWaitAny,
-		osWaitForever);
+		osSemaphoreAcquire(alertSemHandle, osWaitForever);
 
-		CDC_Print("Capture task started\r\n");
+		CDC_Print("Acquired alertSem (counting, count=1)\r\n");
+		CDC_Print("Started captureTask\r\n\r\n");
 
-		while (osEventFlagsGet(alertEventHandle) & 0x01) {
+		while (osSemaphoreGetCount(alertSemHandle) > 0) {
 			// capture image
 			// display image
 			osDelay(100);
 		}
+
+		CDC_Print("Ended captureTask\r\n");
 	}
 	/* USER CODE END StartCaptureTask */
 }
@@ -823,15 +824,17 @@ void StartAlertTask(void *argument) {
 	/* USER CODE BEGIN StartAlertTask */
 	/* Infinite loop */
 	for (;;) {
-		osEventFlagsWait(alertEventHandle, 0x01, osFlagsWaitAny, osWaitForever);
+		osSemaphoreAcquire(alertSemHandle, osWaitForever);
 
-		CDC_Print("Alert task started\r\n");
+		CDC_Print("Acquired alertSem (counting, count=2)\r\n");
+		CDC_Print("Started alertTask\r\n");
 
-		while (osEventFlagsGet(alertEventHandle) & 0x01) {
-			HAL_GPIO_TogglePin(GPIOG, GPIO_PIN_13);
-			CDC_Print("LED toggled\r\n");
+		while (osSemaphoreGetCount(alertSemHandle) > 0) {
+			HAL_GPIO_TogglePin(GPIOG, GPIO_PIN_14);
 			osDelay(500);
 		}
+
+		CDC_Print("Ended alertTask\r\n");
 	}
 	/* USER CODE END StartAlertTask */
 }
@@ -839,8 +842,9 @@ void StartAlertTask(void *argument) {
 /* alertTimerCallback function */
 void alertTimerCallback(void *argument) {
 	/* USER CODE BEGIN alertTimerCallback */
-	CDC_Print("No motion detected for 10 seconds, clearing alert flag...\r\n");
-	osEventFlagsClear(alertEventHandle, 0x01);
+	CDC_Print("Interrupt timeout expired! (10 seconds)\r\n");
+	CDC_Print("Acquired alertSem (counting, count=0)\r\n\r\n");
+	osSemaphoreAcquire(alertSemHandle, 0);
 	/* USER CODE END alertTimerCallback */
 }
 
