@@ -62,7 +62,7 @@ SDRAM_HandleTypeDef hsdram1;
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = { .name = "defaultTask",
-		.stack_size = 128 * 4, .priority = (osPriority_t) osPriorityLow, };
+		.stack_size = 128 * 4, .priority = (osPriority_t) osPriorityNormal, };
 /* Definitions for motionTask */
 osThreadId_t motionTaskHandle;
 const osThreadAttr_t motionTask_attributes =
@@ -70,13 +70,12 @@ const osThreadAttr_t motionTask_attributes =
 				(osPriority_t) osPriorityAboveNormal, };
 /* Definitions for captureTask */
 osThreadId_t captureTaskHandle;
-const osThreadAttr_t captureTask_attributes =
-		{ .name = "captureTask", .stack_size = 128 * 4, .priority =
-				(osPriority_t) osPriorityBelowNormal, };
+const osThreadAttr_t captureTask_attributes = { .name = "captureTask",
+		.stack_size = 128 * 4, .priority = (osPriority_t) osPriorityNormal, };
 /* Definitions for alertTask */
 osThreadId_t alertTaskHandle;
 const osThreadAttr_t alertTask_attributes = { .name = "alertTask", .stack_size =
-		128 * 4, .priority = (osPriority_t) osPriorityNormal, };
+		128 * 4, .priority = (osPriority_t) osPriorityBelowNormal, };
 /* Definitions for alertTimer */
 osTimerId_t alertTimerHandle;
 const osTimerAttr_t alertTimer_attributes = { .name = "alertTimer" };
@@ -133,7 +132,6 @@ int main(void) {
 	HAL_Init();
 
 	/* USER CODE BEGIN Init */
-
 	/* USER CODE END Init */
 
 	/* Configure the system clock */
@@ -723,19 +721,162 @@ static void MX_GPIO_Init(void) {
 }
 
 /* USER CODE BEGIN 4 */
+
 void CDC_Print(const char *msg) {
+	// print over USB CDC
 	while (CDC_Transmit_HS((uint8_t*) msg, strlen(msg)) != USBD_OK) {
 		osDelay(1);
 	}
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
-	CDC_Print("\r\n\r\nInterrupt triggered!\r\n");
+	CDC_Print("\r\nInterrupt triggered!\r\n");
 
+	// check for interrupt on pin PC8
 	if (GPIO_Pin == GPIO_PIN_8) {
+		// release the motion semaphore (binary)
 		osSemaphoreRelease(motionSemHandle);
 	}
 }
+
+// ArduCAM register definitions
+// https://github.com/ArduCAM/STM32/tree/master/STM32L152/HARDWARE/ArduCAM/ArduCAM.h
+
+#define ARDUCHIP_FIFO 0x04
+#define FIFO_CLEAR_MASK 0x01
+#define FIFO_START_MASK 0x02
+#define FIFO_WR_PTR_RST_MASK 0x10
+#define FIFO_RD_PTR_RST_MASK 0x20
+
+#define ARDUCHIP_TRIG 0x41
+#define CAP_DONE_MASK 0x08
+
+#define FIFO_SIZE1 0x42
+#define FIFO_SIZE2 0x43
+#define FIFO_SIZE3 0x44
+
+#define BURST_FIFO_READ 0x3C
+
+void ArduCAM_InitSPI() {
+	// FIFO control
+	uint8_t cmd = 0x80 | ARDUCHIP_FIFO;
+	HAL_SPI_Transmit(&hspi4, &cmd, 1, HAL_MAX_DELAY);
+
+	// clear write done flag, reset write pointer, reset read pointer
+	uint8_t data = FIFO_CLEAR_MASK | FIFO_WR_PTR_RST_MASK | FIFO_RD_PTR_RST_MASK;
+	HAL_SPI_Transmit(&hspi4, &data, 1, HAL_MAX_DELAY);
+}
+
+void ArduCAM_StartCapture() {
+	// FIFO control
+	uint8_t cmd = 0x80 | ARDUCHIP_FIFO;
+	HAL_SPI_Transmit(&hspi4, &cmd, 1, HAL_MAX_DELAY);
+
+	// start capture
+	uint8_t data = FIFO_START_MASK;
+	HAL_SPI_Transmit(&hspi4, &data, 1, HAL_MAX_DELAY);
+}
+
+uint32_t ArduCAM_ReadFIFOLength() {
+	uint8_t cmd = 0x00;
+	uint8_t fifo_size[3] = { 0 };
+
+	cmd = FIFO_SIZE1; // read FIFO [7:0]
+	HAL_SPI_TransmitReceive(&hspi4, &cmd, &fifo_size[0], 1, HAL_MAX_DELAY);
+	cmd = FIFO_SIZE2; // read FIFO [15:8]
+	HAL_SPI_TransmitReceive(&hspi4, &cmd, &fifo_size[1], 1, HAL_MAX_DELAY);
+	cmd = FIFO_SIZE3; // read FIFO [22:16]
+	HAL_SPI_TransmitReceive(&hspi4, &cmd, &fifo_size[2], 1, HAL_MAX_DELAY);
+
+	return (fifo_size[2] << 16) | (fifo_size[1] << 8) | fifo_size[0];
+}
+
+// I2C address
+#define ARDUCAM_I2C_ADDR 0x3C << 1
+
+HAL_StatusTypeDef ArduCAM_WriteI2C(uint16_t reg, uint8_t val) {
+	uint8_t data[3];
+
+	data[0] = (reg >> 8) & 0xFF;
+	data[1] = reg & 0xFF;
+	data[3] = val;
+
+	if (HAL_I2C_Master_Transmit(&hi2c3, ARDUCAM_I2C_ADDR, data, 3,
+	HAL_MAX_DELAY) != HAL_OK) {
+		return HAL_ERROR;
+	}
+
+	return HAL_OK;
+}
+
+HAL_StatusTypeDef ArduCAM_ReadI2C(uint16_t reg, uint8_t *val) {
+	uint8_t reg_addr[2];
+
+	reg_addr[0] = (reg >> 8) & 0xFF;
+	reg_addr[1] = reg & 0xFF;
+
+	if (HAL_I2C_Master_Transmit(&hi2c3, ARDUCAM_I2C_ADDR, reg_addr, 2,
+	HAL_MAX_DELAY) != HAL_OK) {
+		return HAL_ERROR;
+	}
+
+	if (HAL_I2C_Master_Receive(&hi2c3, ARDUCAM_I2C_ADDR, val, 1,
+	HAL_MAX_DELAY) != HAL_OK) {
+		return HAL_ERROR;
+	}
+
+	return HAL_OK;
+}
+
+HAL_StatusTypeDef ArduCAM_WriteSPI(uint8_t reg, uint8_t val) {
+	uint8_t data[2] = { reg | 0x80, val }; // bit[7] = 1 for write
+
+	if (HAL_SPI_Transmit(&hspi4, data, 2, HAL_MAX_DELAY) != HAL_OK) {
+		return HAL_ERROR;
+	}
+
+	return HAL_OK;
+}
+
+HAL_StatusTypeDef ArduCAM_ReadSPI(uint8_t reg, uint8_t *val, uint16_t len) {
+	uint8_t cmd = reg & 0x7F; // bit[7] = 0 for read
+
+	if (HAL_SPI_Transmit(&hspi4, &cmd, 1, HAL_MAX_DELAY) != HAL_OK) {
+		return HAL_ERROR;
+	}
+
+	if (HAL_SPI_Receive(&hspi4, val, len, HAL_MAX_DELAY) != HAL_OK) {
+		return HAL_ERROR;
+	}
+
+	return HAL_OK;
+}
+
+void ArduCAM_Init() {
+	uint8_t chipID_high, chipID_low;
+
+	ArduCAM_ReadI2C(0x300A, &chipID_high);
+	ArduCAM_ReadI2C(0x300B, &chipID_low);
+
+	char buf[64];
+	sprintf(buf, "Chip ID: 0x%X, 0x%X\r\n", chipID_high, chipID_low);
+	CDC_Print(buf);
+
+//	ArduCAM_WriteI2C(0x3008, 0x80); // reset the camera
+//	ArduCAM_WriteI2C(0x4300, 0x30); // set to JPEG mode
+
+	ArduCAM_WriteI2C(0x3808, 0x00); // high byte for 240 width
+	ArduCAM_WriteI2C(0x3809, 0xF0); // low byte for 240 width
+
+	ArduCAM_WriteI2C(0x380A, 0x01); // high byte for 320 height
+	ArduCAM_WriteI2C(0x380B, 0x40); // low byte for 320 height
+}
+
+// LTDC definitions
+#define FRAMEBUFFER_ADDRESS 0xC0000000
+#define LCD_WIDTH  240
+#define LCD_HEIGHT 320
+
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -749,6 +890,25 @@ void StartDefaultTask(void *argument) {
 	/* init code for USB_DEVICE */
 	MX_USB_DEVICE_Init();
 	/* USER CODE BEGIN 5 */
+
+	uint8_t addr;
+	HAL_StatusTypeDef result;
+
+	for (addr = 1; addr < 128; addr++) {
+		result = HAL_I2C_IsDeviceReady(&hi2c3, (addr << 1), 1, 10);
+		if (result == HAL_OK) {
+			char buffer[64];
+			sprintf(buffer, "I2C device found at address 0x%02X\r\n", addr);
+			CDC_Print(buffer);
+		}
+	}
+
+	ArduCAM_Init();
+
+// set the first LTDC layer framebuffer
+//	HAL_LTDC_SetAddress(&hltdc, FRAMEBUFFER_ADDRESS, LTDC_LAYER_1);
+// clear the framebuffer
+//	memset((uint8_t*) FRAMEBUFFER_ADDRESS, 0, LCD_WIDTH * LCD_HEIGHT * 2);
 	/* Infinite loop */
 	for (;;) {
 		osDelay(1000);
@@ -767,18 +927,21 @@ void StartMotionTask(void *argument) {
 	/* USER CODE BEGIN StartMotionTask */
 	/* Infinite loop */
 	for (;;) {
+		// acquire the motion semaphore
 		osSemaphoreAcquire(motionSemHandle, osWaitForever);
 		CDC_Print("Released motionSem (binary, count=1)\r\n\r\n");
 
 		CDC_Print("Acquired motionSem (binary, count=0)\r\n");
 		CDC_Print("Started motionTask\r\n");
 
+		// start the interrupt timeout
 		CDC_Print("Interrupt timeout reset! (10 seconds)\r\n");
 		osTimerStart(alertTimerHandle, 10000);
 
 		CDC_Print("Released alertSem (counting, count=3)\r\n");
 		CDC_Print("Ended motionTask\r\n\r\n");
 
+		// release the alert semaphore (counting)
 		osSemaphoreRelease(alertSemHandle); // count = 1
 		osSemaphoreRelease(alertSemHandle); // count = 2
 		osSemaphoreRelease(alertSemHandle); // count = 3
@@ -797,14 +960,29 @@ void StartCaptureTask(void *argument) {
 	/* USER CODE BEGIN StartCaptureTask */
 	/* Infinite loop */
 	for (;;) {
+		// acquire the alert semaphore
 		osSemaphoreAcquire(alertSemHandle, osWaitForever);
 
 		CDC_Print("Acquired alertSem (counting, count=1)\r\n");
 		CDC_Print("Started captureTask\r\n\r\n");
 
 		while (osSemaphoreGetCount(alertSemHandle) > 0) {
-			// capture image
-			// display image
+			// reset FIFO pointers
+			ArduCAM_WriteSPI(0x04, 0x30);
+
+			// start capture
+			ArduCAM_WriteSPI(0x04, 0x02);
+
+			// read FIFO size
+			uint8_t fifo_size[3];
+			ArduCAM_ReadSPI(0x42, fifo_size, 3);
+			uint32_t total_size = (fifo_size[2] << 16) | (fifo_size[1] << 8)
+					| fifo_size[0];
+
+			char buf[64];
+			sprintf(buf, "FIFO size: %lu\r\n", total_size);
+			CDC_Print(buf);
+
 			osDelay(100);
 		}
 
@@ -824,12 +1002,14 @@ void StartAlertTask(void *argument) {
 	/* USER CODE BEGIN StartAlertTask */
 	/* Infinite loop */
 	for (;;) {
+		// acquire the alert semaphore
 		osSemaphoreAcquire(alertSemHandle, osWaitForever);
 
 		CDC_Print("Acquired alertSem (counting, count=2)\r\n");
 		CDC_Print("Started alertTask\r\n");
 
 		while (osSemaphoreGetCount(alertSemHandle) > 0) {
+			// toggle pin PG14, onboard LED (red)
 			HAL_GPIO_TogglePin(GPIOG, GPIO_PIN_14);
 			osDelay(500);
 		}
@@ -844,6 +1024,7 @@ void alertTimerCallback(void *argument) {
 	/* USER CODE BEGIN alertTimerCallback */
 	CDC_Print("Interrupt timeout expired! (10 seconds)\r\n");
 	CDC_Print("Acquired alertSem (counting, count=0)\r\n\r\n");
+// acquire alert semaphore (stops capture and alert tasks)
 	osSemaphoreAcquire(alertSemHandle, 0);
 	/* USER CODE END alertTimerCallback */
 }
